@@ -135,7 +135,7 @@ async fn main() {
 				.long("address")
 				.value_name("ADDRESS")
 				.help("Sets address to listen on")
-				.default_value("0.0.0.0")
+				.default_value("[::]")
 				.num_args(1),
 		)
 		.arg(
@@ -240,6 +240,9 @@ async fn main() {
 	app.at("/thumb/:point/:id").get(|r| proxy(r, "https://{point}.thumbs.redditmedia.com/{id}").boxed());
 	app.at("/emoji/:id/:name").get(|r| proxy(r, "https://emoji.redditmedia.com/{id}/{name}").boxed());
 	app
+		.at("/emote/:subreddit_id/:filename")
+		.get(|r| proxy(r, "https://reddit-econ-prod-assets-permanent.s3.amazonaws.com/asset-manager/{subreddit_id}/{filename}").boxed());
+	app
 		.at("/preview/:loc/award_images/:fullname/:id")
 		.get(|r| proxy(r, "https://{loc}view.redd.it/award_images/{fullname}/{id}").boxed());
 	app.at("/preview/:loc/:id").get(|r| proxy(r, "https://{loc}view.redd.it/{id}").boxed());
@@ -254,6 +257,7 @@ async fn main() {
 	app.at("/u/:name/comments/:id/:title/:comment_id").get(|r| post::item(r).boxed());
 
 	app.at("/user/[deleted]").get(|req| error(req, "User has deleted their account").boxed());
+	app.at("/user/:name.rss").get(|r| user::rss(r).boxed());
 	app.at("/user/:name").get(|r| user::profile(r).boxed());
 	app.at("/user/:name/:listing").get(|r| user::profile(r).boxed());
 	app.at("/user/:name/comments/:id").get(|r| post::item(r).boxed());
@@ -264,6 +268,9 @@ async fn main() {
 	app.at("/settings").get(|r| settings::get(r).boxed()).post(|r| settings::set(r).boxed());
 	app.at("/settings/restore").get(|r| settings::restore(r).boxed());
 	app.at("/settings/update").get(|r| settings::update(r).boxed());
+
+	// RSS Subscriptions
+	app.at("/r/:sub.rss").get(|r| subreddit::rss(r).boxed());
 
 	// Subreddit services
 	app
@@ -337,7 +344,7 @@ async fn main() {
 			let sub = req.param("sub").unwrap_or_default();
 			match req.param("id").as_deref() {
 				// Share link
-				Some(id) if (8..12).contains(&id.len()) => match canonical_path(format!("/r/{sub}/s/{id}")).await {
+				Some(id) if (8..12).contains(&id.len()) => match canonical_path(format!("/r/{sub}/s/{id}"), 3).await {
 					Ok(Some(path)) => Ok(redirect(&path)),
 					Ok(None) => error(req, "Post ID is invalid. It may point to a post on a community that has been banned.").await,
 					Err(e) => error(req, &e).await,
@@ -356,7 +363,7 @@ async fn main() {
 				Some("best" | "hot" | "new" | "top" | "rising" | "controversial") => subreddit::community(req).await,
 
 				// Short link for post
-				Some(id) if (5..8).contains(&id.len()) => match canonical_path(format!("/{id}")).await {
+				Some(id) if (5..8).contains(&id.len()) => match canonical_path(format!("/{id}"), 3).await {
 					Ok(path_opt) => match path_opt {
 						Some(path) => Ok(redirect(&path)),
 						None => error(req, "Post ID is invalid. It may point to a post on a community that has been banned.").await,

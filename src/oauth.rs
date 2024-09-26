@@ -1,18 +1,19 @@
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, sync::atomic::Ordering, time::Duration};
 
 use crate::{
-	client::{CLIENT, OAUTH_CLIENT},
+	client::{CLIENT, OAUTH_CLIENT, OAUTH_IS_ROLLING_OVER, OAUTH_RATELIMIT_REMAINING},
 	oauth_resources::ANDROID_APP_VERSION_LIST,
 };
 use base64::{engine::general_purpose, Engine as _};
 use hyper::{client, Body, Method, Request};
-use log::info;
+use log::{error, info, trace};
 
 use serde_json::json;
+use tokio::time::{error::Elapsed, timeout};
 
 static REDDIT_ANDROID_OAUTH_CLIENT_ID: &str = "ohXpoqrZYub1kg";
 
-static AUTH_ENDPOINT: &str = "https://accounts.reddit.com";
+static AUTH_ENDPOINT: &str = "https://www.reddit.com";
 
 // Spoofed client for Android devices
 #[derive(Debug, Clone, Default)]
@@ -25,11 +26,32 @@ pub struct Oauth {
 }
 
 impl Oauth {
+	/// Create a new OAuth client
 	pub(crate) async fn new() -> Self {
-		let mut oauth = Self::default();
-		oauth.login().await;
-		oauth
+		// Call new_internal until it succeeds
+		loop {
+			let attempt = Self::new_with_timeout().await;
+			match attempt {
+				Ok(Some(oauth)) => {
+					info!("[✅] Successfully created OAuth client");
+					return oauth;
+				}
+				Ok(None) => {
+					error!("Failed to create OAuth client. Retrying in 5 seconds...");
+					continue;
+				}
+				Err(duration) => {
+					error!("Failed to create OAuth client in {duration:?}. Retrying in 5 seconds...");
+				}
+			}
+		}
 	}
+
+	async fn new_with_timeout() -> Result<Option<Self>, Elapsed> {
+		let mut oauth = Self::default();
+		timeout(Duration::from_secs(5), oauth.login()).await.map(|result| result.map(|_| oauth))
+	}
+
 	pub(crate) fn default() -> Self {
 		// Generate a device to spoof
 		let device = Device::new();
@@ -46,7 +68,7 @@ impl Oauth {
 	}
 	async fn login(&mut self) -> Option<()> {
 		// Construct URL for OAuth token
-		let url = format!("{AUTH_ENDPOINT}/api/access_token");
+		let url = format!("{AUTH_ENDPOINT}/auth/v2/oauth/access-token/loid");
 		let mut builder = Request::builder().method(Method::POST).uri(&url);
 
 		// Add headers from spoofed client
@@ -76,6 +98,8 @@ impl Oauth {
 		// Parse headers - loid header _should_ be saved sent on subsequent token refreshes.
 		// Technically it's not needed, but it's easy for Reddit API to check for this.
 		// It's some kind of header that uniquely identifies the device.
+		// Not worried about the privacy implications, since this is randomly changed
+		// and really only as privacy-concerning as the OAuth token itself.
 		if let Some(header) = resp.headers().get("x-reddit-loid") {
 			self.headers_map.insert("x-reddit-loid".to_owned(), header.to_str().ok()?.to_string());
 		}
@@ -98,21 +122,13 @@ impl Oauth {
 
 		Some(())
 	}
-
-	async fn refresh(&mut self) -> Option<()> {
-		// Refresh is actually just a subsequent login with the same headers (without the old token
-		// or anything). This logic is handled in login, so we just call login again.
-		let refresh = self.login().await;
-		info!("Refreshing OAuth token... {}", if refresh.is_some() { "success" } else { "failed" });
-		refresh
-	}
 }
 
 pub async fn token_daemon() {
 	// Monitor for refreshing token
 	loop {
 		// Get expiry time - be sure to not hold the read lock
-		let expires_in = { OAUTH_CLIENT.read().await.expires_in };
+		let expires_in = { OAUTH_CLIENT.load_full().expires_in };
 
 		// sleep for the expiry time minus 2 minutes
 		let duration = Duration::from_secs(expires_in - 120);
@@ -125,13 +141,22 @@ pub async fn token_daemon() {
 
 		// Refresh token - in its own scope
 		{
-			OAUTH_CLIENT.write().await.refresh().await;
+			force_refresh_token().await;
 		}
 	}
 }
 
 pub async fn force_refresh_token() {
-	OAUTH_CLIENT.write().await.refresh().await;
+	if OAUTH_IS_ROLLING_OVER.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+		trace!("Skipping refresh token roll over, already in progress");
+		return;
+	}
+
+	trace!("Rolling over refresh token. Current rate limit: {}", OAUTH_RATELIMIT_REMAINING.load(Ordering::SeqCst));
+	let new_client = Oauth::new().await;
+	OAUTH_CLIENT.swap(new_client.into());
+	OAUTH_RATELIMIT_REMAINING.store(99, Ordering::SeqCst);
+	OAUTH_IS_ROLLING_OVER.store(false, Ordering::SeqCst);
 }
 
 #[derive(Debug, Clone, Default)]
@@ -179,21 +204,21 @@ fn choose<T: Copy>(list: &[T]) -> T {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_oauth_client() {
-	assert!(!OAUTH_CLIENT.read().await.token.is_empty());
+	assert!(!OAUTH_CLIENT.load_full().token.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_oauth_client_refresh() {
-	OAUTH_CLIENT.write().await.refresh().await.unwrap();
+	force_refresh_token().await;
 }
 #[tokio::test(flavor = "multi_thread")]
 async fn test_oauth_token_exists() {
-	assert!(!OAUTH_CLIENT.read().await.token.is_empty());
+	assert!(!OAUTH_CLIENT.load_full().token.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_oauth_headers_len() {
-	assert!(OAUTH_CLIENT.read().await.headers_map.len() >= 3);
+	assert!(OAUTH_CLIENT.load_full().headers_map.len() >= 3);
 }
 
 #[test]

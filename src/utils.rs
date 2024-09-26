@@ -1,4 +1,5 @@
-use crate::config::get_setting;
+#![allow(dead_code)]
+use crate::config::{self, get_setting};
 //
 // CRATES
 //
@@ -11,9 +12,11 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use rust_embed::RustEmbed;
 use serde_json::Value;
+use serde_json_path::{JsonPath, JsonPathExt};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::str::FromStr;
+use std::string::ToString;
 use time::{macros::format_description, Duration, OffsetDateTime};
 use url::Url;
 
@@ -156,6 +159,7 @@ impl PollOption {
 
 // Post flags with nsfw and stickied
 pub struct Flags {
+	pub spoiler: bool,
 	pub nsfw: bool,
 	pub stickied: bool,
 }
@@ -167,6 +171,7 @@ pub struct Media {
 	pub width: i64,
 	pub height: i64,
 	pub poster: String,
+	pub download_name: String,
 }
 
 impl Media {
@@ -233,6 +238,15 @@ impl Media {
 
 		let alt_url = alt_url_val.map_or(String::new(), |val| format_url(val.as_str().unwrap_or_default()));
 
+		let download_name = if post_type == "image" || post_type == "gif" || post_type == "video" {
+			let permalink_base = url_path_basename(data["permalink"].as_str().unwrap_or_default());
+			let media_url_base = url_path_basename(url_val.as_str().unwrap_or_default());
+
+			format!("redlib_{permalink_base}_{media_url_base}")
+		} else {
+			String::new()
+		};
+
 		(
 			post_type.to_string(),
 			Self {
@@ -243,6 +257,7 @@ impl Media {
 				width: source["width"].as_i64().unwrap_or_default(),
 				height: source["height"].as_i64().unwrap_or_default(),
 				poster: format_url(source["url"].as_str().unwrap_or_default()),
+				download_name,
 			},
 			gallery,
 		)
@@ -296,6 +311,7 @@ pub struct Post {
 	pub body: String,
 	pub author: Author,
 	pub permalink: String,
+	pub link_title: String,
 	pub poll: Option<Poll>,
 	pub score: (String, String),
 	pub upvote_ratio: i64,
@@ -307,11 +323,13 @@ pub struct Post {
 	pub domain: String,
 	pub rel_time: String,
 	pub created: String,
+	pub created_ts: u64,
 	pub num_duplicates: u64,
 	pub comments: (String, String),
 	pub gallery: Vec<GalleryMedia>,
 	pub awards: Awards,
 	pub nsfw: bool,
+	pub out_url: Option<String>,
 	pub ws_url: String,
 }
 
@@ -338,6 +356,7 @@ impl Post {
 			let data = &post["data"];
 
 			let (rel_time, created) = time(data["created_utc"].as_f64().unwrap_or_default());
+			let created_ts = data["created_utc"].as_f64().unwrap_or_default().round() as u64;
 			let score = data["score"].as_i64().unwrap_or_default();
 			let ratio: f64 = data["upvote_ratio"].as_f64().unwrap_or(1.0) * 100.0;
 			let title = val(post, "title");
@@ -384,6 +403,7 @@ impl Post {
 					width: data["thumbnail_width"].as_i64().unwrap_or_default(),
 					height: data["thumbnail_height"].as_i64().unwrap_or_default(),
 					poster: String::new(),
+					download_name: String::new(),
 				},
 				media,
 				domain: val(post, "domain"),
@@ -402,22 +422,25 @@ impl Post {
 					},
 				},
 				flags: Flags {
+					spoiler: data["spoiler"].as_bool().unwrap_or_default(),
 					nsfw: data["over_18"].as_bool().unwrap_or_default(),
 					stickied: data["stickied"].as_bool().unwrap_or_default() || data["pinned"].as_bool().unwrap_or_default(),
 				},
 				permalink: val(post, "permalink"),
+				link_title: val(post, "link_title"),
 				poll: Poll::parse(&data["poll_data"]),
 				rel_time,
 				created,
+				created_ts,
 				num_duplicates: post["data"]["num_duplicates"].as_u64().unwrap_or(0),
 				comments: format_num(data["num_comments"].as_i64().unwrap_or_default()),
 				gallery,
 				awards,
 				nsfw: post["data"]["over_18"].as_bool().unwrap_or_default(),
 				ws_url: val(post, "websocket_url"),
+				out_url: post["data"]["url_overridden_by_dest"].as_str().map(|a| a.to_string()),
 			});
 		}
-
 		Ok((posts, res["data"]["after"].as_str().unwrap_or_default().to_string()))
 	}
 }
@@ -574,6 +597,7 @@ pub struct Preferences {
 	pub front_page: String,
 	pub layout: String,
 	pub wide: String,
+	pub blur_spoiler: String,
 	pub show_nsfw: String,
 	pub blur_nsfw: String,
 	pub hide_hls_notification: String,
@@ -611,6 +635,7 @@ impl Preferences {
 			front_page: setting(req, "front_page"),
 			layout: setting(req, "layout"),
 			wide: setting(req, "wide"),
+			blur_spoiler: setting(req, "blur_spoiler"),
 			show_nsfw: setting(req, "show_nsfw"),
 			hide_sidebar_and_summary: setting(req, "hide_sidebar_and_summary"),
 			blur_nsfw: setting(req, "blur_nsfw"),
@@ -668,6 +693,8 @@ pub async fn parse_post(post: &Value) -> Post {
 	// Determine the type of media along with the media URL
 	let (post_type, media, gallery) = Media::parse(&post["data"]).await;
 
+	let created_ts = post["data"]["created_utc"].as_f64().unwrap_or_default().round() as u64;
+
 	let awards: Awards = Awards::parse(&post["data"]["all_awardings"]);
 
 	let permalink = val(post, "permalink");
@@ -704,6 +731,7 @@ pub async fn parse_post(post: &Value) -> Post {
 			distinguished: val(post, "distinguished"),
 		},
 		permalink,
+		link_title: val(post, "link_title"),
 		poll,
 		score: format_num(score),
 		upvote_ratio: ratio as i64,
@@ -715,6 +743,7 @@ pub async fn parse_post(post: &Value) -> Post {
 			width: post["data"]["thumbnail_width"].as_i64().unwrap_or_default(),
 			height: post["data"]["thumbnail_height"].as_i64().unwrap_or_default(),
 			poster: String::new(),
+			download_name: String::new(),
 		},
 		flair: Flair {
 			flair_parts: FlairPart::parse(
@@ -731,18 +760,21 @@ pub async fn parse_post(post: &Value) -> Post {
 			},
 		},
 		flags: Flags {
+			spoiler: post["data"]["spoiler"].as_bool().unwrap_or_default(),
 			nsfw: post["data"]["over_18"].as_bool().unwrap_or_default(),
 			stickied: post["data"]["stickied"].as_bool().unwrap_or_default() || post["data"]["pinned"].as_bool().unwrap_or(false),
 		},
 		domain: val(post, "domain"),
 		rel_time,
 		created,
+		created_ts,
 		num_duplicates: post["data"]["num_duplicates"].as_u64().unwrap_or(0),
 		comments: format_num(post["data"]["num_comments"].as_i64().unwrap_or_default()),
 		gallery,
 		awards,
 		nsfw: post["data"]["over_18"].as_bool().unwrap_or_default(),
 		ws_url: val(post, "websocket_url"),
+		out_url: post["data"]["url_overridden_by_dest"].as_str().map(|a| a.to_string()),
 	}
 }
 
@@ -888,12 +920,19 @@ pub fn rewrite_urls(input_text: &str) -> String {
 		// Rewrite Reddit links to Redlib
 		REDDIT_REGEX.replace_all(input_text, r#"href="/"#)
 			.to_string();
-	text1 = REDDIT_EMOJI_REGEX
-		.replace_all(&text1, format_url(REDDIT_EMOJI_REGEX.find(&text1).map(|x| x.as_str()).unwrap_or_default()))
-		.to_string()
-		// Remove (html-encoded) "\" from URLs.
-		.replace("%5C", "")
-		.replace("\\_", "_");
+
+	loop {
+		if REDDIT_EMOJI_REGEX.find(&text1).is_none() {
+			break;
+		} else {
+			text1 = REDDIT_EMOJI_REGEX
+				.replace_all(&text1, format_url(REDDIT_EMOJI_REGEX.find(&text1).map(|x| x.as_str()).unwrap_or_default()))
+				.to_string()
+		}
+	}
+
+	// Remove (html-encoded) "\" from URLs.
+	text1 = text1.replace("%5C", "").replace("\\_", "_");
 
 	// Rewrite external media previews to Redlib
 	loop {
@@ -947,6 +986,83 @@ pub fn rewrite_urls(input_text: &str) -> String {
 				.to_string()
 		}
 	}
+}
+
+// These links all follow a pattern of "https://reddit-econ-prod-assets-permanent.s3.amazonaws.com/asset-manager/SUBREDDIT_ID/RANDOM_FILENAME.png"
+static REDDIT_EMOTE_LINK_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r#"https://reddit-econ-prod-assets-permanent.s3.amazonaws.com/asset-manager/(.*)"#).unwrap());
+
+// These all follow a pattern of '"emote|SUBREDDIT_IT|NUMBER"', we want the number
+static REDDIT_EMOTE_ID_NUMBER_REGEX: Lazy<Regex> = Lazy::new(|| Regex::new(r#""emote\|.*\|(.*)""#).unwrap());
+
+pub fn rewrite_emotes(media_metadata: &Value, comment: String) -> String {
+	/* Create the paths we'll use to look for our data inside the json.
+	Because we don't know the name of any given emote we use a wildcard to parse them. */
+	let link_path = JsonPath::parse("$[*].s.u").expect("valid JSON Path");
+	let id_path = JsonPath::parse("$[*].id").expect("valid JSON Path");
+	let size_path = JsonPath::parse("$[*].s.y").expect("valid JSON Path");
+
+	// Extract all of the results from those json paths
+	let link_nodes = media_metadata.json_path(&link_path);
+	let id_nodes = media_metadata.json_path(&id_path);
+
+	// Initialize our vectors
+	let mut id_vec = Vec::new();
+	let mut link_vec = Vec::new();
+
+	// Add the relevant data to each of our vectors so we can access it by number later
+	for current_id in id_nodes {
+		id_vec.push(current_id)
+	}
+	for current_link in link_nodes {
+		link_vec.push(current_link)
+	}
+
+	/* Set index to the length of link_vec.
+	This is one larger than we'll actually be looking at, but we correct that later */
+	let mut index = link_vec.len();
+
+	// Comment needs to be in scope for when we call rewrite_urls()
+	let mut comment = comment;
+
+	/* Loop until index hits zero.
+	This also prevents us from trying to do anything on an empty vector */
+	while index != 0 {
+		/* Subtract 1 from index to get the real index we should be looking at.
+		Then continue on each subsequent loop to continue until we hit the last entry in the vector.
+		This is how we get this to deal with multiple emotes in a single message and properly replace each ID with it's link */
+		index -= 1;
+
+		// Convert our current index in id_vec into a string so we can search through it with regex
+		let current_id = id_vec[index].to_string();
+
+		/* The ID number can be multiple lengths, so we capture it with regex.
+		We also want to only attempt anything when we get matches to avoid panicking */
+		if let Some(id_capture) = REDDIT_EMOTE_ID_NUMBER_REGEX.captures(&current_id) {
+			// Format the ID to include the colons it has in the comment text
+			let id = format!(":{}:", &id_capture[1]);
+
+			// Convert current link to string to search through it with the regex
+			let link = link_vec[index].to_string();
+
+			// Make sure we only do operations when we get matches, otherwise we panic when trying to access the first match
+			if let Some(link_capture) = REDDIT_EMOTE_LINK_REGEX.captures(&link) {
+				/* Reddit sends a size for the image based on whether it's alone or accompanied by text.
+				It's a good idea and makes everything look nicer, so we'll do the same. */
+				let size = media_metadata.json_path(&size_path).first().unwrap().to_string();
+
+				// Replace the ID we found earlier in the comment with the respective image and it's link from the regex capture
+				let to_replace_with = format!(
+					"<img loading=\"lazy\" src=\"/emote/{} width=\"{size}\" height=\"{size}\" style=\"vertical-align:text-bottom\">",
+					&link_capture[1]
+				);
+
+				// Inside the comment replace the ID we found with the string that will embed the image
+				comment = comment.replace(&id, &to_replace_with).to_string();
+			}
+		}
+	}
+	// Call rewrite_urls() to transform any other Reddit links
+	rewrite_urls(&comment)
 }
 
 // Format vote count to a string that will be displayed.
@@ -1028,7 +1144,7 @@ pub fn redirect(path: &str) -> Response<Body> {
 
 /// Renders a generic error landing page.
 pub async fn error(req: Request<Body>, msg: &str) -> Result<Response<Body>, String> {
-	error!("Error page rendered: {msg}");
+	error!("Error page rendered: {}", msg.split('|').next().unwrap_or_default());
 	let url = req.uri().to_string();
 	let body = ErrorTemplate {
 		msg: msg.to_string(),
@@ -1050,6 +1166,28 @@ pub async fn error(req: Request<Body>, msg: &str) -> Result<Response<Body>, Stri
 /// be denied.
 pub fn sfw_only() -> bool {
 	match get_setting("REDLIB_SFW_ONLY") {
+		Some(val) => val == "on",
+		None => false,
+	}
+}
+
+/// Returns true if the config/env variable REDLIB_ENABLE_RSS is set to "on".
+/// If this variable is set as such, the instance will enable RSS feeds.
+/// Otherwise, the instance will not provide RSS feeds.
+pub fn enable_rss() -> bool {
+	match get_setting("REDLIB_ENABLE_RSS") {
+		Some(val) => val == "on",
+		None => false,
+	}
+}
+
+/// Returns true if the config/env variable `REDLIB_ROBOTS_DISABLE_INDEXING` carries the
+/// value `on`.
+///
+/// If this variable is set as such, the instance will block all robots in robots.txt and
+/// insert the noindex, nofollow meta tag on every page.
+pub fn disable_indexing() -> bool {
+	match get_setting("REDLIB_ROBOTS_DISABLE_INDEXING") {
 		Some(val) => val == "on",
 		None => false,
 	}
@@ -1094,6 +1232,34 @@ pub async fn nsfw_landing(req: Request<Body>, req_url: String) -> Result<Respons
 	.unwrap_or_default();
 
 	Ok(Response::builder().status(403).header("content-type", "text/html").body(body.into()).unwrap_or_default())
+}
+
+// Returns the last (non-empty) segment of a path string
+pub fn url_path_basename(path: &str) -> String {
+	let url_result = Url::parse(format!("https://libredd.it/{path}").as_str());
+
+	if url_result.is_err() {
+		path.to_string()
+	} else {
+		let mut url = url_result.unwrap();
+		url.path_segments_mut().unwrap().pop_if_empty();
+
+		url.path_segments().unwrap().last().unwrap().to_string()
+	}
+}
+
+// Returns the URL of a post, as needed by RSS feeds
+pub fn get_post_url(post: &Post) -> String {
+	if let Some(out_url) = &post.out_url {
+		// Handle cross post
+		if out_url.starts_with("/r/") {
+			format!("{}{}", config::get_setting("REDLIB_FULL_URL").unwrap_or_default(), out_url)
+		} else {
+			out_url.to_string()
+		}
+	} else {
+		format!("{}{}", config::get_setting("REDLIB_FULL_URL").unwrap_or_default(), post.permalink)
+	}
 }
 
 #[cfg(test)]
@@ -1203,4 +1369,28 @@ fn test_rewriting_image_links() {
 		r#"<p><a href="https://preview.redd.it/6awags382xo31.png?width=2560&amp;format=png&amp;auto=webp&amp;s=9c563aed4f07a91bdd249b5a3cea43a79710dcfc">caption 1</a></p>"#;
 	let output = r#"<p><figure><a href="/preview/pre/6awags382xo31.png?width=2560&amp;format=png&amp;auto=webp&amp;s=9c563aed4f07a91bdd249b5a3cea43a79710dcfc"><img loading="lazy" src="/preview/pre/6awags382xo31.png?width=2560&amp;format=png&amp;auto=webp&amp;s=9c563aed4f07a91bdd249b5a3cea43a79710dcfc"></a><figcaption>caption 1</figcaption></figure></p"#;
 	assert_eq!(rewrite_urls(input), output);
+}
+
+#[test]
+fn test_url_path_basename() {
+	// without trailing slash
+	assert_eq!(url_path_basename("/first/last"), "last");
+	// with trailing slash
+	assert_eq!(url_path_basename("/first/last/"), "last");
+	// with query parameters
+	assert_eq!(url_path_basename("/first/last/?some=query"), "last");
+	// file path
+	assert_eq!(url_path_basename("/cdn/image.jpg"), "image.jpg");
+	// when a full url is passed instead of just a path
+	assert_eq!(url_path_basename("https://doma.in/first/last"), "last");
+	// empty path
+	assert_eq!(url_path_basename("/"), "");
+}
+
+#[test]
+fn test_rewriting_emotes() {
+	let json_input = serde_json::from_str(r#"{"emote|t5_31hpy|2028":{"e":"Image","id":"emote|t5_31hpy|2028","m":"image/png","s":{"u":"https://reddit-econ-prod-assets-permanent.s3.amazonaws.com/asset-manager/t5_31hpy/PW6WsOaLcd.png","x":60,"y":60},"status":"valid","t":"sticker"}}"#).expect("Valid JSON");
+	let comment_input = r#"<div class="comment_body "><div class="md"><p>:2028:</p></div></div>"#;
+	let output = r#"<div class="comment_body "><div class="md"><p><img loading="lazy" src="/emote/t5_31hpy/PW6WsOaLcd.png" width="60" height="60" style="vertical-align:text-bottom"></p></div></div>"#;
+	assert_eq!(rewrite_emotes(&json_input, comment_input.to_string()), output);
 }
