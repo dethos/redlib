@@ -6,6 +6,7 @@ use crate::config::{self, get_setting};
 // CRATES
 //
 use crate::{client::json, server::RequestExt};
+use clearurls::UrlCleaner;
 use cookie::Cookie;
 use hyper::{Body, Request, Response};
 use libflate::deflate::{Decoder, Encoder};
@@ -23,6 +24,7 @@ use std::env;
 use std::io::{Read, Write};
 use std::str::FromStr;
 use std::string::ToString;
+use std::sync::Mutex;
 use time::{macros::format_description, Duration, OffsetDateTime};
 use url::Url;
 
@@ -269,7 +271,7 @@ impl Media {
 		(
 			post_type.to_string(),
 			Self {
-				url: format_url(url_val.as_str().unwrap_or_default()),
+				url: format_url(clean_url(url_val.as_str().unwrap_or_default()).as_str()),
 				alt_url,
 				// Note: in the data["is_reddit_media_domain"] path above
 				// width and height will be 0.
@@ -1075,6 +1077,22 @@ pub fn format_url(url: &str) -> String {
 	}
 }
 
+// Remove tracking query params
+static URL_CLEANER: Lazy<Mutex<UrlCleaner>> = Lazy::new(|| Mutex::new(UrlCleaner::from_embedded_rules().expect("Failed to initialize UrlCleaner")));
+
+pub fn clean_url(url: &str) -> String {
+	let is_external_url = match Url::parse(url) {
+		Ok(parsed_url) => parsed_url.domain().is_some(),
+		_ => false,
+	};
+	let mut cleaned_url = url.to_owned();
+	if is_external_url {
+		let cleaner = URL_CLEANER.lock().unwrap();
+		cleaned_url = cleaner.clear_single_url_str(url).expect("Unable to clean the URL.").as_ref().to_owned();
+	}
+	cleaned_url
+}
+
 static REGEX_BULLET: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?m)^- (.*)$").unwrap());
 static REGEX_BULLET_CONSECUTIVE_LINES: Lazy<Regex> = Lazy::new(|| Regex::new(r"</ul>\n<ul>").unwrap());
 
@@ -1628,11 +1646,11 @@ fn test_rewriting_bullet_list() {
 - Super resolution + Off (it looks horrible anyway)
 - Sharpness 50 (default one I think)
 - Black level High (low messes up gray colors)
-- DFC Off 
+- DFC Off
 - Response Time Middle (personal preference, <a href="https://www.blurbusters.com/">https://www.blurbusters.com/</a> show horrible overdrive with it on high)
 - Freesync doesn&#39;t matter
 - Black stabilizer 50
-- Gamma setting on 0 
+- Gamma setting on 0
 - Color Temp Medium
 How`s your monitor by the way? Any IPS bleed whatsoever? I either got lucky or the panel is pretty good, 0 bleed for me, just the usual IPS glow. How about the pixels? I see the pixels even at one meter away, especially on Microsoft Edge&#39;s icon for example, the blue background is just blocky, don&#39;t know why.</p>
 </div>"#;
