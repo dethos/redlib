@@ -5,7 +5,7 @@ use futures_lite::{future::Boxed, FutureExt};
 use hyper::client::HttpConnector;
 use hyper::header::HeaderValue;
 use hyper::{body, body::Buf, header, Body, Client, Method, Request, Response, Uri};
-use hyper_rustls::HttpsConnector;
+use hyper_rustls::{ConfigBuilderExt, HttpsConnector};
 use libflate::gzip;
 use log::{error, trace, warn};
 use once_cell::sync::Lazy;
@@ -15,7 +15,7 @@ use serde_json::Value;
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicU16};
 use std::{io, result::Result};
-
+use std::sync::LazyLock;
 use crate::dbg_msg;
 use crate::oauth::{force_refresh_token, token_daemon, Oauth};
 use crate::server::RequestExt;
@@ -30,8 +30,36 @@ const REDDIT_SHORT_URL_BASE_HOST: &str = "redd.it";
 const ALTERNATIVE_REDDIT_URL_BASE: &str = "https://www.reddit.com";
 const ALTERNATIVE_REDDIT_URL_BASE_HOST: &str = "www.reddit.com";
 
-pub static HTTPS_CONNECTOR: Lazy<HttpsConnector<HttpConnector>> =
-	Lazy::new(|| hyper_rustls::HttpsConnectorBuilder::new().with_native_roots().https_only().enable_http2().build());
+pub static HTTPS_CONNECTOR: LazyLock<HttpsConnector<HttpConnector>> = LazyLock::new(|| {
+	hyper_rustls::HttpsConnectorBuilder::new()
+		.with_tls_config(
+			rustls::ClientConfig::builder()
+				// These are the Firefox 145.0 cipher suite,
+				// minus the suites missing forward-secrecy support,
+				// in the same order.
+				// https://github.com/redlib-org/redlib/issues/446#issuecomment-3609306592
+				.with_cipher_suites(&[
+					rustls::cipher_suite::TLS13_AES_256_GCM_SHA384,
+					rustls::cipher_suite::TLS13_AES_128_GCM_SHA256,
+					rustls::cipher_suite::TLS13_CHACHA20_POLY1305_SHA256,
+					rustls::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+					rustls::cipher_suite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+					rustls::cipher_suite::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+					rustls::cipher_suite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+					rustls::cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+					rustls::cipher_suite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+				])
+				// .with_safe_default_cipher_suites()
+				.with_safe_default_kx_groups()
+				.with_safe_default_protocol_versions()
+				.unwrap()
+				.with_native_roots()
+				.with_no_client_auth(),
+		)
+		.https_only()
+		.enable_http2()
+		.build()
+});
 
 pub static CLIENT: Lazy<Client<HttpsConnector<HttpConnector>>> = Lazy::new(|| Client::builder().build::<_, Body>(HTTPS_CONNECTOR.clone()));
 
